@@ -1,6 +1,7 @@
 """Tests for Gorgolath hash-native protocol."""
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 
 import pytest
 from fastapi.testclient import TestClient
@@ -20,9 +21,8 @@ from daemonos.provision.enrollment import EnrollmentService, EnrollmentRequest
 
 
 def test_skill_issue_digest_constant():
-    assert SKILL_ISSUE_DIGEST == content_digest("unused")  # wrong on purpose check length
     assert len(SKILL_ISSUE_DIGEST) == 64
-    assert SKILL_ISSUE_DIGEST == __import__("hashlib").sha256(b"skill issue").hexdigest()
+    assert SKILL_ISSUE_DIGEST == hashlib.sha256(b"skill issue").hexdigest()
 
 
 def test_canonical_deterministic():
@@ -109,7 +109,7 @@ def test_discover_profile_via_gorgolath():
     )
     identity = enrollment.request_enrollment(req)
     enrollment.authorize(identity.node_id, req.requested_capabilities)
-    node, token = enrollment.complete_enrollment(identity.node_id)
+    _node, token = enrollment.complete_enrollment(identity.node_id)
 
     daemon = GorgolathDaemon(include_debug=True)
     env = Envelope(
@@ -122,7 +122,6 @@ def test_discover_profile_via_gorgolath():
     assert resp.envelope.kind == EnvelopeKind.RESPONSE
     assert resp.result_digest
     assert resp.envelope.correlation_id == env.message_id
-    # Resolve hash-linked result
     resolved = daemon.resolve(resp.result_digest, token)
     assert "profile" in resolved
     assert resolved["profile"]["hardware"]["arch"] == "arm64"
@@ -172,7 +171,6 @@ def test_api_gorgolath_e2e():
     assert r.status_code == 200
     assert r.json()["payload"]["profile"]["hardware"]["model"] == "SynthPhone X"
 
-    # Unknown hash
     r = client.post(
         "/v1/gorgolath/resolve",
         json={"digest": "00" * 32},
