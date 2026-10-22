@@ -8,7 +8,7 @@ from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
 from daemonos.core.auth import AuthorizationError, CapabilityToken
-from daemonos.core.task import TaskSpec
+from daemonos.core.task import TaskSpec, TaskState
 from daemonos.fleet.inventory import FleetInventory, NodeRecord, NodeHealth
 from daemonos.provision.enrollment import (
     EnrollmentService,
@@ -117,8 +117,9 @@ def create_app(
         )
         try:
             task = executor.submit(spec, token)
-            # auto-run in this scaffold for the simulated path
-            task = executor.accept_and_run(task.id, token)
+            # auto-run only if still pending (idempotent replay returns existing task)
+            if task.state == TaskState.PENDING:
+                task = executor.accept_and_run(task.id, token)
         except AuthorizationError as e:
             raise HTTPException(status_code=403, detail=str(e)) from e
         return task.model_dump(mode="json")
