@@ -1,4 +1,4 @@
-"""Versioned API: nodes, tasks, discovery, planning, operations."""
+"""Versioned API: nodes, tasks, discovery, planning, gorgolath, operations."""
 
 from __future__ import annotations
 
@@ -7,18 +7,20 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
+from daemonos.api.gorgolath_routes import build_gorgolath_router
+from daemonos.catalog.loader import load_builtin_catalog
 from daemonos.core.auth import AuthorizationError, CapabilityToken, check_capability
 from daemonos.core.task import TaskSpec, TaskState
-from daemonos.fleet.inventory import FleetInventory, NodeRecord, NodeHealth
+from daemonos.discovery.service import DiscoveryService
+from daemonos.fleet.inventory import FleetInventory, NodeHealth, NodeRecord
+from daemonos.gorgolath import GorgolathDaemon
+from daemonos.planner.planner import DeploymentPlanner
 from daemonos.provision.enrollment import (
-    EnrollmentService,
     EnrollmentRequest,
+    EnrollmentService,
     EnrollmentState,
 )
-from daemonos.runtime import TaskStore, SimulatedExecutor
-from daemonos.discovery.service import DiscoveryService
-from daemonos.planner.planner import DeploymentPlanner
-from daemonos.catalog.loader import load_builtin_catalog
+from daemonos.runtime import SimulatedExecutor, TaskStore
 
 
 class TaskCreateBody(BaseModel):
@@ -49,6 +51,7 @@ def create_app(
     executor: SimulatedExecutor | None = None,
     discovery: DiscoveryService | None = None,
     planner: DeploymentPlanner | None = None,
+    gorgolath: GorgolathDaemon | None = None,
 ) -> FastAPI:
     enrollment = enrollment or EnrollmentService()
     fleet = fleet or FleetInventory()
@@ -56,13 +59,14 @@ def create_app(
     executor = executor or SimulatedExecutor(store, fleet, enrollment)
     discovery = discovery or DiscoveryService()
     planner = planner or DeploymentPlanner()
+    gorgolath = gorgolath or GorgolathDaemon(discovery=discovery, planner=planner)
 
     app = FastAPI(
         title="DaemonOS API",
-        version="1.1.0",
+        version="1.2.0",
         description=(
             "Machine-native API for DaemonOS control plane, "
-            "hardware discovery, and deployment planning"
+            "hardware discovery, deployment planning, and Gorgolath hash protocol"
         ),
     )
 
@@ -83,60 +87,40 @@ def create_app(
             raise HTTPException(status_code=401, detail="authentication required")
         return token
 
-    # ---- Self-describing operations (agent discovery) ----
-
     @app.get("/v1/operations")
     def list_operations() -> dict[str, Any]:
-        """Machine-readable list of available operations and schemas."""
         return {
-            "api_version": "1.1.0",
+            "api_version": "1.2.0",
             "operations": [
                 {
                     "id": "list_operations",
                     "method": "GET",
                     "path": "/v1/operations",
                     "auth": False,
-                    "description": "List available API operations",
                 },
                 {
-                    "id": "list_discovery_providers",
+                    "id": "gorgolath_meta",
                     "method": "GET",
-                    "path": "/v1/discovery/providers",
-                    "auth": True,
-                    "capability": "discover",
+                    "path": "/v1/gorgolath/meta",
+                    "auth": False,
                 },
                 {
-                    "id": "list_devices",
-                    "method": "GET",
-                    "path": "/v1/discovery/devices",
-                    "auth": True,
-                    "capability": "discover",
+                    "id": "gorgolath_envelope",
+                    "method": "POST",
+                    "path": "/v1/gorgolath/envelope",
+                    "auth": "operation-dependent",
                 },
                 {
-                    "id": "list_probes",
-                    "method": "GET",
-                    "path": "/v1/discovery/devices/{provider}/{device_key}/probes",
+                    "id": "gorgolath_resolve",
+                    "method": "POST",
+                    "path": "/v1/gorgolath/resolve",
                     "auth": True,
-                    "capability": "discover",
+                    "capability": "gorgolath.resolve",
                 },
                 {
                     "id": "discover_device",
                     "method": "POST",
                     "path": "/v1/discovery/profile",
-                    "auth": True,
-                    "capability": "discover",
-                    "body_schema": {
-                        "provider": "string",
-                        "device_key": "string",
-                        "probe_ids": "string[] | null",
-                    },
-                    "side_effects": False,
-                    "modifies_device": False,
-                },
-                {
-                    "id": "list_catalog_targets",
-                    "method": "GET",
-                    "path": "/v1/catalog/targets",
                     "auth": True,
                     "capability": "discover",
                 },
@@ -146,15 +130,6 @@ def create_app(
                     "path": "/v1/plan",
                     "auth": True,
                     "capability": "plan",
-                    "body_schema": {
-                        "provider": "string",
-                        "device_key": "string",
-                        "objective": "string",
-                        "probe_ids": "string[] | null",
-                    },
-                    "side_effects": False,
-                    "modifies_device": False,
-                    "executes_plan": False,
                 },
                 {
                     "id": "list_nodes",
@@ -171,8 +146,6 @@ def create_app(
                 },
             ],
         }
-
-    # ---- Discovery (read-only) ----
 
     @app.get("/v1/discovery/providers")
     def discovery_providers(authorization: str | None = Header(default=None)) -> dict[str, Any]:
@@ -225,8 +198,6 @@ def create_app(
             raise HTTPException(status_code=404, detail=str(e)) from e
         return profile.model_dump(mode="json")
 
-    # ---- Catalog ----
-
     @app.get("/v1/catalog/targets")
     def catalog_targets(authorization: str | None = Header(default=None)) -> dict[str, Any]:
         token = require_token(authorization)
@@ -240,8 +211,6 @@ def create_app(
             "targets": [t.model_dump(mode="json") for t in cat.targets],
             "strategies": [s.model_dump(mode="json") for s in cat.strategies],
         }
-
-    # ---- Planning (never executes) ----
 
     @app.post("/v1/plan")
     def plan_deployment(
@@ -258,12 +227,9 @@ def create_app(
         except KeyError as e:
             raise HTTPException(status_code=404, detail=str(e)) from e
         result = planner.plan(profile, objective=body.objective)
-        # Hard guarantee in response
         assert result.execution_authorized is False
         assert result.side_effects == []
         return result.model_dump(mode="json")
-
-    # ---- Existing fleet / task endpoints ----
 
     @app.get("/v1/nodes")
     def list_nodes(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
@@ -279,7 +245,9 @@ def create_app(
         return node.model_dump(mode="json")
 
     @app.get("/v1/nodes/{node_id}/capabilities")
-    def get_capabilities(node_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    def get_capabilities(
+        node_id: str, authorization: str | None = Header(default=None)
+    ) -> dict[str, Any]:
         require_token(authorization)
         manifest = fleet.get_manifest(node_id)
         if manifest is None:
@@ -329,7 +297,9 @@ def create_app(
         return task.model_dump(mode="json")
 
     @app.post("/v1/tasks/{task_id}/cancel")
-    def cancel_task(task_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    def cancel_task(
+        task_id: str, authorization: str | None = Header(default=None)
+    ) -> dict[str, Any]:
         token = resolve_token(authorization)
         try:
             task = executor.cancel(task_id, token)
@@ -350,6 +320,8 @@ def create_app(
             "node.report",
             "discover",
             "plan",
+            "gorgolath.resolve",
+            "gorgolath.store",
         ]
         identity = enrollment.request_enrollment(req)
         enrollment.authorize(identity.node_id, caps)
@@ -376,4 +348,6 @@ def create_app(
     app.state.executor = executor
     app.state.discovery = discovery
     app.state.planner = planner
+    app.state.gorgolath = gorgolath
+    app.include_router(build_gorgolath_router(gorgolath, resolve_token))
     return app
