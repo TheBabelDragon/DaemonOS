@@ -42,7 +42,6 @@ def build_gorgolath_router(
 
     @router.get("/meta")
     def meta() -> dict[str, Any]:
-        """Protocol metadata (hash personality constants)."""
         return {
             "protocol": "gorgolath",
             "protocol_version": PROTOCOL_VERSION,
@@ -63,11 +62,30 @@ def build_gorgolath_router(
     ) -> dict[str, Any]:
         token = resolve_token(authorization)
         data = body.model_dump(exclude_none=True)
-        # pydantic already parsed kind
+        # Strip client envelope_digest; HTTP intake re-seals after parse so
+        # timestamp/null normalization cannot false-positive as tamper.
+        # Content digests are still verified when both payload and content_digest present.
+        client_content_digest = data.pop("content_digest", None)
+        data.pop("envelope_digest", None)
         env = Envelope(**data)
-        if not env.envelope_digest:
-            env.seal()
-        # Optional debug via explicit header only
+        if env.payload is not None and client_content_digest:
+            env.content_digest = client_content_digest
+            if not env.verify_content():
+                env = Envelope(
+                    kind=EnvelopeKind.ERROR,
+                    correlation_id=env.message_id,
+                    operation=env.operation,
+                    error_code=__import__(
+                        "daemonos.gorgolath.envelope", fromlist=["ProtocolErrorCode"]
+                    ).ProtocolErrorCode.TAMPERED,
+                    error_digest=SKILL_ISSUE_DIGEST,
+                ).seal()
+                return {
+                    "envelope": env.model_dump(mode="json"),
+                    "result_digest": None,
+                    "error_digest": SKILL_ISSUE_DIGEST,
+                }
+        env.seal()
         if x_gorgolath_debug == "1":
             daemon.include_debug = True
         resp = daemon.handle(env, token)
@@ -105,7 +123,6 @@ def build_gorgolath_router(
         digest: str,
         authorization: str | None = Header(default=None),
     ) -> dict[str, Any]:
-        """Human-readable debug interface — explicit, separate from hash surface."""
         token = resolve_token(authorization)
         try:
             payload = daemon.resolve(digest, token)
