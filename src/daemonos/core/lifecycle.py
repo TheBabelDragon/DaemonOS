@@ -47,6 +47,7 @@ class TaskLifecycle:
         if not TaskLifecycle.can_transition(task, to_state):
             raise InvalidTransitionError(task.id, task.state, to_state)
 
+        prev = task.state
         now = datetime.now(timezone.utc)
         task.state = to_state
         task.touch()
@@ -61,7 +62,7 @@ class TaskLifecycle:
                 task.result = result
             if error is not None:
                 task.error = error
-        elif to_state == TaskState.PENDING and task.state != TaskState.PENDING:
+        elif to_state == TaskState.PENDING and prev != TaskState.PENDING:
             # retry path
             task.retry_count += 1
             task.result = None
