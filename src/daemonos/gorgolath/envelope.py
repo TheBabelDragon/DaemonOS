@@ -35,25 +35,30 @@ class ProtocolErrorCode(str, Enum):
     INTERNAL = "internal"
 
 
+def _ts(dt: datetime) -> str:
+    """UTC timestamp with millisecond precision for stable digests."""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt = dt.astimezone(timezone.utc)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(dt.microsecond / 1000):03d}Z"
+
+
 class Envelope(BaseModel):
     """Versioned protocol envelope."""
 
     protocol_version: str = PROTOCOL_VERSION
     kind: EnvelopeKind
     message_id: str = Field(default_factory=lambda: str(uuid4()))
-    correlation_id: str | None = None  # links response to request
+    correlation_id: str | None = None
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     nonce: str = Field(default_factory=lambda: uuid4().hex)
-    operation: str | None = None  # e.g. discover.profile, plan, resolve
-    # Content is referenced by digest; body may be omitted for pure-hash mode
+    operation: str | None = None
     content_digest: str | None = None
     payload: dict[str, Any] | None = None
-    # Optional integrity over the envelope fields excluding this signature field
     envelope_digest: str | None = None
-    # Auth binding — token id, not a privilege grant by itself
     auth_ref: str | None = None
     error_code: ProtocolErrorCode | None = None
-    error_digest: str | None = None  # hash-oriented error identity
+    error_digest: str | None = None
 
     def compute_content_digest(self) -> str:
         if self.payload is None:
@@ -61,30 +66,35 @@ class Envelope(BaseModel):
         return content_digest(self.payload)
 
     def seal(self) -> Envelope:
-        """Fill content_digest and envelope_digest from current fields."""
         if self.payload is not None:
             self.content_digest = content_digest(self.payload)
         self.envelope_digest = self._envelope_digest()
         return self
 
     def _envelope_digest(self) -> str:
-        body = {
+        # Only non-null fields participate — stable across JSON omit/include of nulls
+        body: dict[str, Any] = {
             "protocol_version": self.protocol_version,
             "kind": self.kind.value,
             "message_id": self.message_id,
-            "correlation_id": self.correlation_id,
-            "timestamp": self.timestamp.isoformat(),
+            "timestamp": _ts(self.timestamp),
             "nonce": self.nonce,
-            "operation": self.operation,
-            "content_digest": self.content_digest,
-            "auth_ref": self.auth_ref,
-            "error_code": self.error_code.value if self.error_code else None,
-            "error_digest": self.error_digest,
         }
+        if self.correlation_id is not None:
+            body["correlation_id"] = self.correlation_id
+        if self.operation is not None:
+            body["operation"] = self.operation
+        if self.content_digest is not None:
+            body["content_digest"] = self.content_digest
+        if self.auth_ref is not None:
+            body["auth_ref"] = self.auth_ref
+        if self.error_code is not None:
+            body["error_code"] = self.error_code.value
+        if self.error_digest is not None:
+            body["error_digest"] = self.error_digest
         return content_digest(body)
 
     def verify_integrity(self) -> bool:
-        """Check envelope_digest matches canonical fields (not authorization)."""
         if not self.envelope_digest:
             return False
         return self.envelope_digest == self._envelope_digest()
