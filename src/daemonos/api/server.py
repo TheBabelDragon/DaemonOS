@@ -1,4 +1,4 @@
-"""Versioned API: nodes, capabilities, health, tasks."""
+"""Versioned API: nodes, tasks, discovery, planning, operations."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 
-from daemonos.core.auth import AuthorizationError, CapabilityToken
+from daemonos.core.auth import AuthorizationError, CapabilityToken, check_capability
 from daemonos.core.task import TaskSpec, TaskState
 from daemonos.fleet.inventory import FleetInventory, NodeRecord, NodeHealth
 from daemonos.provision.enrollment import (
@@ -16,6 +16,9 @@ from daemonos.provision.enrollment import (
     EnrollmentState,
 )
 from daemonos.runtime import TaskStore, SimulatedExecutor
+from daemonos.discovery.service import DiscoveryService
+from daemonos.planner.planner import DeploymentPlanner
+from daemonos.catalog.loader import load_builtin_catalog
 
 
 class TaskCreateBody(BaseModel):
@@ -26,9 +29,17 @@ class TaskCreateBody(BaseModel):
     node_id: str | None = None
 
 
-class ErrorBody(BaseModel):
-    error: str
-    detail: str | None = None
+class DiscoverBody(BaseModel):
+    provider: str = "mock"
+    device_key: str
+    probe_ids: list[str] | None = None
+
+
+class PlanBody(BaseModel):
+    provider: str = "mock"
+    device_key: str
+    objective: str = "run_agent"
+    probe_ids: list[str] | None = None
 
 
 def create_app(
@@ -36,16 +47,23 @@ def create_app(
     fleet: FleetInventory | None = None,
     store: TaskStore | None = None,
     executor: SimulatedExecutor | None = None,
+    discovery: DiscoveryService | None = None,
+    planner: DeploymentPlanner | None = None,
 ) -> FastAPI:
     enrollment = enrollment or EnrollmentService()
     fleet = fleet or FleetInventory()
     store = store or TaskStore()
     executor = executor or SimulatedExecutor(store, fleet, enrollment)
+    discovery = discovery or DiscoveryService()
+    planner = planner or DeploymentPlanner()
 
     app = FastAPI(
         title="DaemonOS API",
-        version="1.0.0",
-        description="Machine-native API for DaemonOS control plane",
+        version="1.1.0",
+        description=(
+            "Machine-native API for DaemonOS control plane, "
+            "hardware discovery, and deployment planning"
+        ),
     )
 
     def resolve_token(authorization: str | None) -> CapabilityToken | None:
@@ -59,19 +77,202 @@ def create_app(
             raise HTTPException(status_code=401, detail="invalid or expired token")
         return token
 
-    @app.get("/v1/nodes")
-    def list_nodes(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    def require_token(authorization: str | None) -> CapabilityToken:
         token = resolve_token(authorization)
-        # listing requires any valid token for now
         if token is None:
             raise HTTPException(status_code=401, detail="authentication required")
+        return token
+
+    # ---- Self-describing operations (agent discovery) ----
+
+    @app.get("/v1/operations")
+    def list_operations() -> dict[str, Any]:
+        """Machine-readable list of available operations and schemas."""
+        return {
+            "api_version": "1.1.0",
+            "operations": [
+                {
+                    "id": "list_operations",
+                    "method": "GET",
+                    "path": "/v1/operations",
+                    "auth": False,
+                    "description": "List available API operations",
+                },
+                {
+                    "id": "list_discovery_providers",
+                    "method": "GET",
+                    "path": "/v1/discovery/providers",
+                    "auth": True,
+                    "capability": "discover",
+                },
+                {
+                    "id": "list_devices",
+                    "method": "GET",
+                    "path": "/v1/discovery/devices",
+                    "auth": True,
+                    "capability": "discover",
+                },
+                {
+                    "id": "list_probes",
+                    "method": "GET",
+                    "path": "/v1/discovery/devices/{provider}/{device_key}/probes",
+                    "auth": True,
+                    "capability": "discover",
+                },
+                {
+                    "id": "discover_device",
+                    "method": "POST",
+                    "path": "/v1/discovery/profile",
+                    "auth": True,
+                    "capability": "discover",
+                    "body_schema": {
+                        "provider": "string",
+                        "device_key": "string",
+                        "probe_ids": "string[] | null",
+                    },
+                    "side_effects": False,
+                    "modifies_device": False,
+                },
+                {
+                    "id": "list_catalog_targets",
+                    "method": "GET",
+                    "path": "/v1/catalog/targets",
+                    "auth": True,
+                    "capability": "discover",
+                },
+                {
+                    "id": "plan_deployment",
+                    "method": "POST",
+                    "path": "/v1/plan",
+                    "auth": True,
+                    "capability": "plan",
+                    "body_schema": {
+                        "provider": "string",
+                        "device_key": "string",
+                        "objective": "string",
+                        "probe_ids": "string[] | null",
+                    },
+                    "side_effects": False,
+                    "modifies_device": False,
+                    "executes_plan": False,
+                },
+                {
+                    "id": "list_nodes",
+                    "method": "GET",
+                    "path": "/v1/nodes",
+                    "auth": True,
+                },
+                {
+                    "id": "create_task",
+                    "method": "POST",
+                    "path": "/v1/tasks",
+                    "auth": True,
+                    "capability": "task.submit",
+                },
+            ],
+        }
+
+    # ---- Discovery (read-only) ----
+
+    @app.get("/v1/discovery/providers")
+    def discovery_providers(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        token = require_token(authorization)
+        try:
+            check_capability(token, "discover")
+        except AuthorizationError as e:
+            raise HTTPException(status_code=403, detail=str(e)) from e
+        return {"providers": discovery.list_providers()}
+
+    @app.get("/v1/discovery/devices")
+    def discovery_devices(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        token = require_token(authorization)
+        try:
+            check_capability(token, "discover")
+        except AuthorizationError as e:
+            raise HTTPException(status_code=403, detail=str(e)) from e
+        return {"devices": discovery.list_devices()}
+
+    @app.get("/v1/discovery/devices/{provider}/{device_key}/probes")
+    def discovery_probes(
+        provider: str,
+        device_key: str,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        token = require_token(authorization)
+        try:
+            check_capability(token, "discover")
+        except AuthorizationError as e:
+            raise HTTPException(status_code=403, detail=str(e)) from e
+        try:
+            probes = discovery.list_probes(provider, device_key)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        return {"probes": [p.model_dump(mode="json") for p in probes]}
+
+    @app.post("/v1/discovery/profile")
+    def discover_profile(
+        body: DiscoverBody,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        token = require_token(authorization)
+        try:
+            check_capability(token, "discover")
+        except AuthorizationError as e:
+            raise HTTPException(status_code=403, detail=str(e)) from e
+        try:
+            profile = discovery.discover(body.provider, body.device_key, body.probe_ids)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        return profile.model_dump(mode="json")
+
+    # ---- Catalog ----
+
+    @app.get("/v1/catalog/targets")
+    def catalog_targets(authorization: str | None = Header(default=None)) -> dict[str, Any]:
+        token = require_token(authorization)
+        try:
+            check_capability(token, "discover")
+        except AuthorizationError as e:
+            raise HTTPException(status_code=403, detail=str(e)) from e
+        cat = load_builtin_catalog()
+        return {
+            "catalog_version": cat.catalog_version,
+            "targets": [t.model_dump(mode="json") for t in cat.targets],
+            "strategies": [s.model_dump(mode="json") for s in cat.strategies],
+        }
+
+    # ---- Planning (never executes) ----
+
+    @app.post("/v1/plan")
+    def plan_deployment(
+        body: PlanBody,
+        authorization: str | None = Header(default=None),
+    ) -> dict[str, Any]:
+        token = require_token(authorization)
+        try:
+            check_capability(token, "plan")
+        except AuthorizationError as e:
+            raise HTTPException(status_code=403, detail=str(e)) from e
+        try:
+            profile = discovery.discover(body.provider, body.device_key, body.probe_ids)
+        except KeyError as e:
+            raise HTTPException(status_code=404, detail=str(e)) from e
+        result = planner.plan(profile, objective=body.objective)
+        # Hard guarantee in response
+        assert result.execution_authorized is False
+        assert result.side_effects == []
+        return result.model_dump(mode="json")
+
+    # ---- Existing fleet / task endpoints ----
+
+    @app.get("/v1/nodes")
+    def list_nodes(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+        require_token(authorization)
         return [n.model_dump(mode="json") for n in fleet.list_nodes()]
 
     @app.get("/v1/nodes/{node_id}")
     def get_node(node_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        token = resolve_token(authorization)
-        if token is None:
-            raise HTTPException(status_code=401, detail="authentication required")
+        require_token(authorization)
         node = fleet.get(node_id)
         if node is None:
             raise HTTPException(status_code=404, detail="node not found")
@@ -79,9 +280,7 @@ def create_app(
 
     @app.get("/v1/nodes/{node_id}/capabilities")
     def get_capabilities(node_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        token = resolve_token(authorization)
-        if token is None:
-            raise HTTPException(status_code=401, detail="authentication required")
+        require_token(authorization)
         manifest = fleet.get_manifest(node_id)
         if manifest is None:
             raise HTTPException(status_code=404, detail="capabilities not found")
@@ -89,9 +288,7 @@ def create_app(
 
     @app.get("/v1/nodes/{node_id}/health")
     def get_health(node_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        token = resolve_token(authorization)
-        if token is None:
-            raise HTTPException(status_code=401, detail="authentication required")
+        require_token(authorization)
         node = fleet.get(node_id)
         if node is None:
             raise HTTPException(status_code=404, detail="node not found")
@@ -117,7 +314,6 @@ def create_app(
         )
         try:
             task = executor.submit(spec, token)
-            # auto-run only if still pending (idempotent replay returns existing task)
             if task.state == TaskState.PENDING:
                 task = executor.accept_and_run(task.id, token)
         except AuthorizationError as e:
@@ -126,9 +322,7 @@ def create_app(
 
     @app.get("/v1/tasks/{task_id}")
     def get_task(task_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
-        token = resolve_token(authorization)
-        if token is None:
-            raise HTTPException(status_code=401, detail="authentication required")
+        require_token(authorization)
         task = store.get(task_id)
         if task is None:
             raise HTTPException(status_code=404, detail="task not found")
@@ -147,11 +341,18 @@ def create_app(
             raise HTTPException(status_code=409, detail=str(e)) from e
         return task.model_dump(mode="json")
 
-    # Bootstrap helpers for local/sim use (not production)
     @app.post("/v1/bootstrap/enroll")
     def bootstrap_enroll(req: EnrollmentRequest) -> dict[str, Any]:
+        caps = req.requested_capabilities or [
+            "task.submit",
+            "task.execute",
+            "task.cancel",
+            "node.report",
+            "discover",
+            "plan",
+        ]
         identity = enrollment.request_enrollment(req)
-        enrollment.authorize(identity.node_id, req.requested_capabilities or ["task.submit", "task.execute", "task.cancel", "node.report"])
+        enrollment.authorize(identity.node_id, caps)
         node, token = enrollment.complete_enrollment(identity.node_id)
         record = NodeRecord(
             node_id=node.node_id,
@@ -169,9 +370,10 @@ def create_app(
             "expires_at": token.expires_at.isoformat(),
         }
 
-    # Attach services for testing
     app.state.enrollment = enrollment
     app.state.fleet = fleet
     app.state.store = store
     app.state.executor = executor
+    app.state.discovery = discovery
+    app.state.planner = planner
     return app
