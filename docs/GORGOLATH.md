@@ -64,3 +64,11 @@ Resolution of an unknown digest returns a deterministic structured error (HTTP 4
 ```bash
 PYTHONPATH=src python examples/gorgolath_agent.py
 ```
+
+## Canonical binary protocol
+
+A versioned binary wire format is also available. See [GORGOLATH_BINARY.md](GORGOLATH_BINARY.md).
+
+- `POST /v1/gorgolath/binary` — raw binary request/response
+- `GET /v1/gorgolath/binary/ops` — machine-readable operation catalog
+- Domain-separated SHA-256 digests; canonical JSON arguments
